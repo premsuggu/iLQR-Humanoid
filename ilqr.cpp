@@ -812,7 +812,7 @@ bool iLQR::solve(const std::vector<casadi::DM>& x_guess,
             return false;
         }
 
-        std::cout << "cost vefore fwd pass: " << current_cost_ << std::endl;
+        std::cout << "cost before fwd pass: " << current_cost_ << std::endl;
         if (!forwardPass()) {
             // break;
         }
