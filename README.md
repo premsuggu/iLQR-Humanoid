@@ -13,11 +13,13 @@ A sophisticated implementation of iterative Linear Quadratic Regulator (iLQR) wi
 
 ## Platform Requirements
 
-⚠️ **Linux Only**: This project requires Linux due to Pinocchio dependency limitations. If you're on Windows, please use WSL (Windows Subsystem for Linux) or a Linux virtual machine.
 
 **Tested on:**
-- Ubuntu 20.04/22.04
+- Ubuntu 20.04/22.04/24.04
 - WSL2 with Ubuntu
+- macOS with Homebrew
+
+**Note:** While Pinocchio supports multiple platforms, this guide focuses on Linux installation as it provides the most straightforward build process.
 
 ## Dependencies
 
@@ -29,14 +31,18 @@ A sophisticated implementation of iterative Linear Quadratic Regulator (iLQR) wi
 
 ## Installation Instructions
 
-### 1. Clone the Repository
+### Option 1: Linux/WSL2 (Recommended)
+
+This is the tested installation path.
+
+#### 1. Clone the Repository
 
 ```bash
 git clone https://github.com/premsuggu/iLQR-Humanoid.git
 cd iLQR-Humanoid
 ```
 
-### 2. Install System Dependencies
+#### 2. Install System Dependencies
 
 ```bash
 # Ubuntu/Debian
@@ -51,7 +57,7 @@ sudo apt install liburdfdom-dev liburdfdom-headers-dev
 sudo apt install libassimp-dev liboctomap-dev libfcl-dev
 ```
 
-### 3. Build CasADi from Source
+#### 3. Build CasADi from Source
 
 ```bash
 # Clone CasADi
@@ -77,7 +83,7 @@ make install
 cd ../../
 ```
 
-### 4. Build Pinocchio from Source
+#### 4. Build Pinocchio from Source
 
 ```bash
 # Clone Pinocchio with submodules
@@ -105,7 +111,7 @@ make install
 cd ../../
 ```
 
-### 5. Build the MPC Project
+#### 5. Build the MPC Project
 
 ```bash
 # Create build directory in project root
@@ -119,6 +125,7 @@ cmake .. \
 # Build the project
 make -j$(nproc)
 ```
+
 
 ## Running the Simulation
 
