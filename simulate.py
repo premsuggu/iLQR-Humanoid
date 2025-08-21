@@ -5,14 +5,14 @@ import mujoco.viewer
 import time
 
 model = mujoco.MjModel.from_xml_path("/home/prem/wb_mpc/robots/h1_description/mjcf/scene.xml")
-q_trajectory = pd.read_csv("/home/prem/mpc/build/q_optimal3.csv", header=None).values
+q_trajectory = pd.read_csv("/home/prem/mpc/walk/q_ref.csv", header=None).values
 data = mujoco.MjData(model)
 
 frame = 0
 num_frames = len(q_trajectory)
 
 # q_trajectory[:, 0] = -q_trajectory[:, 0]
-# q_trajectory[:, 2] = q_trajectory[:, 2] + 0.14
+q_trajectory[:, 2] = q_trajectory[:, 2] + 0.14
 # q_trajectory[:, 1] = -q_trajectory[:, 1] 
 q_trajectory[:, 2] = 1.043;
 with mujoco.viewer.launch_passive(model, data) as viewer:

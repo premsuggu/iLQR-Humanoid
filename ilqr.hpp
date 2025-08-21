@@ -1,11 +1,13 @@
 #pragma once
 #include <vector>
+#include <memory>
 #include <casadi/casadi.hpp>
+#include "robot_utils.hpp"  
 
 class iLQR {
 public:
     // Constructor & initialization
-    iLQR(int state_dim, int control_dim, int horizon, double dt, double m, double L);
+    iLQR(int state_dim, int control_dim, int horizon, double dt, const std::string& urdf_path);
     
     // Main solve function
     bool solve(const std::vector<casadi::DM>& x_guess, const std::vector<casadi::DM>& x_ref, const std::vector<casadi::DM>& u_ref);
@@ -14,8 +16,9 @@ public:
     std::vector<casadi::DM> getStates() const { return x_traj_; }
     std::vector<casadi::DM> getControls() const { return u_traj_; }
     double getCost() const { return current_cost_; }
-    casadi::DM pendulumDynamics(const casadi::DM& x, const casadi::DM& u);
-    
+    casadi::DM getContactForces() const;
+    casadi::DM humanoidDynamics(const casadi::DM& x, const casadi::DM& u);
+
     // Set Parameters
     void setMaxIter(int max_iter) { max_iter_ = max_iter; }
     void setCostWeights(const casadi::DM& Q, const casadi::DM& R, const casadi::DM& Qf) {Q_ = Q; R_ = R; Qf_ = Qf;};
@@ -25,12 +28,11 @@ public:
     void setBounds(double u_min, double u_max) {u_min_ = u_min; u_max_ = u_max;}
 
 private:
+    // Robot Model
+    std::unique_ptr<RobotUtils> robot_utils_;  
     // Problem dimensions
     int nx_, nu_, N_;
     double dt_;
-
-    // Pendulum parameters
-    double m_; double L_; double g_;
     
     // Problem functions 
     casadi::DM Q_, R_, Qf_;
@@ -103,7 +105,7 @@ private:
     std::vector<casadi::DM> d_;           // feedforward gains    ->     d = -Q_{vv}^{-1} Q_v 
     
     // Algorithm parameters
-    int max_iter_ = 100;
+    int max_iter_ = 20;
     double tolerance_ = 1e-6;
     double reg_ = 1e-6;
     double rho_art_ = 1e3;
@@ -120,11 +122,15 @@ private:
     casadi::SX createStageCost();
     casadi::SX createConstraintCost();
     casadi::SX createFOHDynamics();
-    casadi::SX pendulumContinuousDynamics(const casadi::SX& x, const casadi::SX& u);
+    casadi::DM computeInverseDynamics(const casadi::DM& q, const casadi::DM& qd, const casadi::DM& qdd);
+
     void createDynamicsJacobians(const casadi::SX& foh_dynamics);
     void collectAllVariables(std::vector<casadi::SX>& all_vars);
     void createCostDerivativeFunctions(const casadi::SX& stage_cost, const std::vector<casadi::SX>& all_vars);
     void createConstraintDerivativeFunctions(const casadi::SX& constraint_cost, const std::vector<casadi::SX>& all_vars);
+
+    casadi::Function cached_inv_dyn_func_;
+    bool inv_dyn_func_cached_ = false;
 
     // TO update Cost derivatives
     void quadratizeCost();

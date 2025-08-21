@@ -1,7 +1,14 @@
 #include "ilqr.hpp"
 
-iLQR::iLQR(int state_dim, int control_dim, int horizon, double dt, double m, double L) 
-    : nx_(state_dim), nu_(control_dim), N_(horizon), dt_(dt), m_(m), L_(L), g_(9.81) {
+iLQR::iLQR(int state_dim, int control_dim, int horizon, double dt, const std::string& urdf_path) 
+    : nx_(state_dim), nu_(control_dim), N_(horizon), dt_(dt){
+    
+    robot_utils_ = std::make_unique<RobotUtils>(urdf_path);
+    
+    // Verify dimensions match
+    if (robot_utils_->nx() != state_dim || robot_utils_->nu() != control_dim) {
+        throw std::runtime_error("Dimension mismatch between robot model and iLQR settings");
+    }
     
     // PDF Reference: Section 8.3 - FOH requires midpoint variables
     x_traj_.resize(N_ + 1);          // States: x_0, x_1, ..., x_N
@@ -148,8 +155,8 @@ iLQR::iLQR(int state_dim, int control_dim, int horizon, double dt, double m, dou
     }
     
     // ============ COST TRACKING ============
-    current_cost_ = 1e4;
-    previous_cost_ = 1e4;
+    current_cost_ = 1e5;
+    previous_cost_ = 1e5;
     converged_ = false;
     
     // ============ COST WEIGHTS ============
@@ -158,7 +165,7 @@ iLQR::iLQR(int state_dim, int control_dim, int horizon, double dt, double m, dou
     Qf_ = 10 * casadi::DM::eye(nx_);      // Terminal cost weight
     
     // ============ ALGORITHM PARAMETERS ============
-    max_iter_ = 50;
+    max_iter_ = 1;
     tolerance_ = 1e-6;
     reg_ = 1e-6;
     rho_art_ = 1e3;                  // Artificial control penalty
@@ -167,7 +174,7 @@ iLQR::iLQR(int state_dim, int control_dim, int horizon, double dt, double m, dou
     // CONSTRAINT BOUNDS ============
     u_min_ = -100;
     u_max_ = 100;
-    
+
     // ============ INITIALIZE SYMBOLIC FRAMEWORK ============
     createSymbolicFramework();
     std::cout << "Symbolic framework created successfully!" << std::endl;
@@ -194,8 +201,9 @@ void iLQR::createSymbolicFramework() {
     }
     
     // Create cost functions
-    std::cout << "Creating cost functions..." << std::endl;
+    std::cout << "Creating cost cost..." << std::endl;
     casadi::SX stage_cost = createStageCost();
+    std::cout << "Creating constraint cost..." << std::endl;
     casadi::SX constraint_cost = createConstraintCost();
     casadi::SX total_cost = stage_cost + constraint_cost;
     
@@ -212,7 +220,7 @@ void iLQR::createSymbolicFramework() {
     foh_dynamics_func_ = casadi::Function("foh_dynamics", {x_sym_[0], u_sym_[0], u_sym_[1]}, {foh_dynamics});
     
     createDynamicsJacobians(foh_dynamics);
-    
+    std::cout << "computing derivatives" << std::endl;
     // Create all derivative functions
     createCostDerivativeFunctions(stage_cost, all_vars);
     createConstraintDerivativeFunctions(constraint_cost, all_vars);  
@@ -222,33 +230,29 @@ void iLQR::createSymbolicFramework() {
 casadi::SX iLQR::createStageCost() {
     casadi::SX stage_cost = 0;
     
-    // Terminal cost
-    casadi::SX x_final_error = x_sym_[N_] - x_ref_sym_[N_];
-    stage_cost += 0.5 * casadi::SX::mtimes({x_final_error.T(), Qf_, x_final_error});
-    
-    // Simpson's integration - using algebraic midpoint expressions
+    // Terminal cost using robot_utils
+    casadi::SX terminal_cost = robot_utils_->symCostStage(x_sym_[N_], casadi::SX::zeros(nu_, 1), x_ref_sym_[N_], casadi::SX::zeros(nu_, 1));
+    stage_cost += robot_utils_->weights.terminal_scale * terminal_cost;
+
+    // Simpson's integration for stage costs
     for (int k = 0; k < N_; k++) {
-        // Left endpoint cost
-        casadi::SX x_error_k = x_sym_[k] - x_ref_sym_[k];
-        casadi::SX u_error_k = u_sym_[k] - u_ref_sym_[k];
-        casadi::SX cost_left = 0.5 * casadi::SX::mtimes({x_error_k.T(), Q_, x_error_k}) + 
-                               0.5 * casadi::SX::mtimes({u_error_k.T(), R_, u_error_k});
         
-        // Right endpoint cost  
-        casadi::SX x_error_k1 = x_sym_[k+1] - x_ref_sym_[k+1];
-        casadi::SX cost_right = 0.5 * casadi::SX::mtimes({x_error_k1.T(), Q_, x_error_k1});
-        if (k < N_ - 1) {
-            casadi::SX u_error_k1 = u_sym_[k+1] - u_ref_sym_[k+1];
-            cost_right += 0.5 * casadi::SX::mtimes({u_error_k1.T(), R_, u_error_k1});
-        }
+        // Left endpoint cost using robot_utils
+        casadi::SX cost_left = robot_utils_->symCostStage(x_sym_[k], u_sym_[k], x_ref_sym_[k], u_ref_sym_[k]);
         
-        // Midpoint cost - using algebraic expressions
+        // Right endpoint cost
+        casadi::SX cost_right = robot_utils_->symCostStage(x_sym_[k+1], 
+                                                          (k < N_-1) ? u_sym_[k+1] : casadi::SX::zeros(nu_, 1),
+                                                          x_ref_sym_[k+1], 
+                                                          (k < N_-1) ? u_ref_sym_[k+1] : casadi::SX::zeros(nu_, 1));
+        
+        // Midpoint cost (if k < N-1)
         casadi::SX cost_mid = 0;
         if (k < N_ - 1) {
-            // Define midpoints as algebraic expressions (PDF Section 8.7.1)
-            casadi::SX f_k = pendulumContinuousDynamics(x_sym_[k], u_sym_[k]);
-            casadi::SX f_k1 = pendulumContinuousDynamics(x_sym_[k+1], u_sym_[k+1]);
-            
+            // Compute midpoint dynamics using robot_utils
+            casadi::SX f_k = robot_utils_->symFloatingBaseDynamics(x_sym_[k], u_sym_[k]);
+            casadi::SX f_k1 = robot_utils_->symFloatingBaseDynamics(x_sym_[k+1], u_sym_[k+1]);
+
             // Hermite-Simpson midpoint state
             casadi::SX x_mid_expr = 0.5 * (x_sym_[k] + x_sym_[k+1]) + (dt_/8.0) * (f_k - f_k1);
             casadi::SX u_mid_expr = 0.5 * (u_sym_[k] + u_sym_[k+1]);
@@ -257,43 +261,27 @@ casadi::SX iLQR::createStageCost() {
             casadi::SX x_mid_ref = 0.5 * (x_ref_sym_[k] + x_ref_sym_[k+1]);
             casadi::SX u_mid_ref = 0.5 * (u_ref_sym_[k] + u_ref_sym_[k+1]);
             
-            // Midpoint cost using expressions
-            casadi::SX x_mid_error = x_mid_expr - x_mid_ref;
-            casadi::SX u_mid_error = u_mid_expr - u_mid_ref;
-            
-            cost_mid = 0.5 * casadi::SX::mtimes({x_mid_error.T(), Q_, x_mid_error}) + 
-                       0.5 * casadi::SX::mtimes({u_mid_error.T(), R_, u_mid_error});
+            // Midpoint cost using robot_utils
+            cost_mid = robot_utils_->symCostStage(x_mid_expr, u_mid_expr,  x_mid_ref, u_mid_ref);
         }
         
         // Simpson's rule
         stage_cost += (dt_ / 6.0) * (cost_left + 4 * cost_mid + cost_right);
-        // Artificial control
+        
+        // Artificial control penalty
         stage_cost += 0.5 * rho_art_ * casadi::SX::dot(u_art_sym_[k], u_art_sym_[k]);
     }
-        
+    
     return stage_cost;
 }
 
-// Helper function
-casadi::SX iLQR::pendulumContinuousDynamics(const casadi::SX& x, const casadi::SX& u) {
-    casadi::SX theta = x(0), theta_dot = x(1);
-    casadi::SX torque = u(0);
-    casadi::SX theta_ddot = (torque - m_ * g_ * L_ * sin(theta)) / (m_ * L_ * L_);
-    return casadi::SX::vertcat({theta_dot, theta_ddot});
-}
 
 // Create constraint cost - PDF Reference: Section 3.1
 casadi::SX iLQR::createConstraintCost() {
     casadi::SX constraint_cost = 0;
-    
     for (int k = 0; k < N_; k++) {
-        casadi::SX torque = u_sym_[k](0);
-        
-        // Soft constraint: quadratic penalty outside bounds
-        casadi::SX upper_violation = casadi::SX::fmax(0, torque - u_max_);
-        casadi::SX lower_violation = casadi::SX::fmax(0, u_min_ - torque);
-        constraint_cost += 1000.0 * (upper_violation * upper_violation + 
-                                    lower_violation * lower_violation);
+        // Use robot_utils constraint penalty function
+        constraint_cost += robot_utils_->symConstraintPenalty(x_sym_[k], u_sym_[k]);
     }
     
     return constraint_cost;
@@ -301,12 +289,10 @@ casadi::SX iLQR::createConstraintCost() {
 
 // Create FOH dynamics - PDF Reference: Section 8.3
 casadi::SX iLQR::createFOHDynamics() {
-    casadi::SX theta = x_sym_[0](0), theta_dot = x_sym_[0](1);
-    casadi::SX torque_avg = 0.5 * (u_sym_[0](0) + u_sym_[1](0));  // FOH average
-    casadi::SX theta_ddot = (torque_avg - m_ * g_ * L_ * sin(theta)) / (m_ * L_ * L_);
-    casadi::SX f_continuous = casadi::SX::vertcat({theta_dot, theta_ddot});
-    
-    return x_sym_[0] + dt_ * f_continuous;  // Euler integration
+    // FOH control averaging
+    casadi::SX u_avg = 0.5 * (u_sym_[0] + u_sym_[1]);
+    casadi::SX f_continuous = robot_utils_->symFloatingBaseDynamics(x_sym_[0], u_avg);              // Get continuous dynamics
+    return x_sym_[0] + dt_ * f_continuous;          // Euler integration
 }
 
 // Create dynamics Jacobians - PDF Reference: Section 8.3, Equation (43)
@@ -318,6 +304,7 @@ void iLQR::createDynamicsJacobians(const casadi::SX& foh_dynamics) {
     dynamics_jac_A_ = casadi::Function("dyn_jac_A", {x_sym_[0], u_sym_[0], u_sym_[1]}, {A_expr});
     dynamics_jac_B_ = casadi::Function("dyn_jac_B", {x_sym_[0], u_sym_[0], u_sym_[1]}, {B_expr});
     dynamics_jac_C_ = casadi::Function("dyn_jac_C", {x_sym_[0], u_sym_[0], u_sym_[1]}, {C_expr});
+    std::cout << "computed the dynamics derivatives" << std::endl;
 }
 
 // Collect all variables in correct order
@@ -380,6 +367,7 @@ void iLQR::createCostDerivativeFunctions(const casadi::SX& stage_cost, const std
             cost_hess_vy_[k] = casadi::Function("cost_hess_vy_" + std::to_string(k), all_vars, {casadi::SX::jacobian(casadi::SX::gradient(stage_cost, u_sym_[k+1]), x_sym_[k+1])});
         }
     }
+    std::cout << "computed the cost derivatives" << std::endl;
 }
 
 // Add to createSymbolicFramework() after cost derivatives
@@ -398,6 +386,7 @@ void iLQR::createConstraintDerivativeFunctions(const casadi::SX& constraint_cost
         constraint_hess_ux_[k] = casadi::Function("constraint_hess_ux_" + std::to_string(k), 
             all_vars, {casadi::SX::jacobian(casadi::SX::gradient(constraint_cost, u_sym_[k]), x_sym_[k])});
     }
+    std::cout << "computed the constraint derivatives" << std::endl;
 }
 
 // PDF Reference: Section 8.7.2 "Second order expansion of L(x,u,y,v)"
@@ -407,11 +396,11 @@ void iLQR::quadratizeCost() {
     
     // Evaluate all derivatives numerically
     for (int k = 0; k <= N_; k++) {
-        // State derivatives (exist for all time points)
+        // State derivatives ([0,N])
         L_x_[k] = cost_grad_x_[k](all_inputs)[0];
         L_xx_[k] = cost_hess_xx_[k](all_inputs)[0];
         
-        if (k < N_) {
+        if (k < N_) {            // [0,N)
             // Current control derivatives
             L_u_[k] = cost_grad_u_[k](all_inputs)[0];
             L_uu_[k] = cost_hess_uu_[k](all_inputs)[0];
@@ -432,8 +421,9 @@ void iLQR::quadratizeCost() {
             L_uy_[k] = cost_hess_uy_[k](all_inputs)[0];
             L_yu_[k] = cost_hess_yu_[k](all_inputs)[0];
             
-            // Next control derivatives (v = u_{k+1}) - only for k < N-1
+            // Next control derivatives (v = u_{k+1})
             if (k < N_ - 1) {
+                // [0, N-1)
                 L_v_[k] = cost_grad_v_[k](all_inputs)[0];
                 L_vv_[k] = cost_hess_vv_[k](all_inputs)[0];
                 
@@ -689,7 +679,7 @@ void iLQR::applyRegularization(int k) {
         // Check condition number and adapt
         double det = static_cast<double>(casadi::DM::det(Q_uu_[k]));
         if (std::abs(det) < 1e-10) {
-            adaptive_reg *= 100;  // Aggressive increase
+            adaptive_reg *= 100;                // Aggressive increase
             Q_uu_[k] += adaptive_reg * I;
         }
     } else {
@@ -827,10 +817,9 @@ bool iLQR::solve(const std::vector<casadi::DM>& x_guess,
             // break;
         }
         
-        // updateMultipliers();
-        
         if (checkConvergence()) {
             converged_ = true;
+            casadi::DM contact_forces = getContactForces();
             std::cout << "Converged after " << iter + 1 << " iterations!" << std::endl;
             break;
         }
@@ -842,36 +831,45 @@ bool iLQR::solve(const std::vector<casadi::DM>& x_guess,
 
 // Initialize trajectory from initial guess
 void iLQR::initializeTrajectory(const std::vector<casadi::DM>& x_guess) {
-    // Check if guess size is consistent
     if (x_guess.size() != x_traj_.size()) {
-        std::cerr << "Error: Provided initial trajectory guess size (" << x_guess.size() 
+        std::cerr << "Error: Provided initial trajectory guess size (" << x_guess.size()
                   << ") does not match required size (" << x_traj_.size() << ")" << std::endl;
         throw std::runtime_error("Initial trajectory guess size mismatch");
     }
     
-    // Copy guess to trajectory
-    for (int k = 0; k < static_cast<int>(x_guess.size()); ++k) {
+    for (int k = 0; k < static_cast<double>(x_guess.size()); ++k) {
         x_traj_[k] = x_guess[k];
     }
     
-    // Compute controls that satisfy dynamics for the given state trajectory
+    // Compute feasible controls using robot dynamics
     for (int k = 0; k < N_; k++) {
-        // Compute required control using inverse dynamics
         casadi::DM x_current = x_traj_[k];
         casadi::DM x_next = x_traj_[k + 1];
-                
-        casadi::DM theta_current = x_current(0);
-        casadi::DM theta_dot_current = x_current(1);
-        casadi::DM theta_next = x_next(0);
-        casadi::DM theta_dot_next = x_next(1);
-        casadi::DM theta_ddot_required = (theta_dot_next - theta_dot_current) / dt_;
-
-        casadi::DM u_required = m_ * L_ * L_ * theta_ddot_required + m_ * g_ * L_ * sin(theta_current);
+        
+        // Extract q and qd from current and next states
+        casadi::DM q_current = x_current(casadi::Slice(0, robot_utils_->nq()));
+        casadi::DM qd_current = x_current(casadi::Slice(robot_utils_->nq(), robot_utils_->nx()));
+        casadi::DM q_next = x_next(casadi::Slice(0, robot_utils_->nq()));
+        casadi::DM qd_next = x_next(casadi::Slice(robot_utils_->nq(), robot_utils_->nx()));
+        
+        // Compute required acceleration using finite differences
+        casadi::DM qdd_required = (qd_next - qd_current) / dt_;
+        
+        // Use inverse dynamics to compute required torques
+        casadi::DM u_required = computeInverseDynamics(q_current, qd_current, qdd_required);
         
         u_traj_[k] = u_required;
-        u_art_[k] = casadi::DM::zeros(nx_);  // No artificial control needed
+        u_art_[k] = casadi::DM::zeros(nx_);              // No artificial control needed for consistent trajectory
     }
 }
+
+
+// Dynamics helper
+casadi::DM iLQR::humanoidDynamics(const casadi::DM& x, const casadi::DM& u) {
+
+    return foh_dynamics_func_(std::vector<casadi::DM>{x, u, u})[0];
+}
+
 
 // Compute current trajectory cost
 double iLQR::computeCost() {
@@ -880,13 +878,25 @@ double iLQR::computeCost() {
     return static_cast<double>(total_cost_func_(all_inputs)[0]);
 }
 
-// Pendulum dynamics for simulation
-casadi::DM iLQR::pendulumDynamics(const casadi::DM& x, const casadi::DM& u) {
-    casadi::DM theta = x(0), theta_dot = x(1);
-    casadi::DM torque = u(0);
-    casadi::DM theta_ddot = (torque - m_ * g_ * L_ * sin(theta)) / (m_ * L_ * L_);
-    return casadi::DM::vertcat({theta_dot, theta_ddot});
+casadi::DM iLQR::computeInverseDynamics(const casadi::DM& q, const casadi::DM& qd, const casadi::DM& qdd) {
+    if (!inv_dyn_func_cached_) {
+        casadi::SX q_sym = casadi::SX::sym("q_temp", robot_utils_->nq());
+        casadi::SX qd_sym = casadi::SX::sym("qd_temp", robot_utils_->nv());
+        casadi::SX qdd_sym = casadi::SX::sym("qdd_temp", robot_utils_->nv());
+        
+        casadi::SX tau_expr = robot_utils_->symInverseDynamics(q_sym, qd_sym, qdd_sym);
+        cached_inv_dyn_func_ = casadi::Function("cached_inverse_dynamics", 
+                                               {q_sym, qd_sym, qdd_sym}, {tau_expr});
+        inv_dyn_func_cached_ = true;
+    }
+    
+    return cached_inv_dyn_func_(std::vector<casadi::DM>{q, qd, qdd})[0];
 }
+
+casadi::DM iLQR::getContactForces() const {
+    return robot_utils_->computeContactForcesNumeric(x_traj_, u_traj_);
+}
+
 
 // Update constraint multipliers
 void iLQR::updateMultipliers() {
